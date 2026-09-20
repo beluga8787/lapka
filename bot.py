@@ -6,32 +6,30 @@ import secrets
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.filters import CommandStart, Command
+from aiogram.types import (
+    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery,
+    LabeledPrice, PreCheckoutQuery
+)
 from aiogram.enums import ChatMemberStatus
 
-# ==================== НАСТРОЙКИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ====================
+# ==================== НАСТРОЙКИ ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003954792992"))
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-BOOSTY_LINK = os.getenv("BOOSTY_LINK", "https://boosty.to/твой-ник")
-CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/+hA9MFI38UaY5YTZi")
+CODE_PRICE_STARS = int(os.getenv("CODE_PRICE_STARS", "100"))  # цена в Stars
+# ===================================================
 
 if not BOT_TOKEN:
-    raise RuntimeError("❌ Переменная окружения BOT_TOKEN не задана!")
+    raise RuntimeError("❌ BOT_TOKEN не задан!")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 DB = "promo.db"
 
 
-# ==================== БАЗА ДАННЫХ ====================
+# ==================== БАЗА ====================
 def init_db():
     conn = sqlite3.connect(DB)
     c = conn.cursor()
@@ -40,14 +38,8 @@ def init_db():
             code TEXT PRIMARY KEY,
             used INTEGER DEFAULT 0,
             user_id INTEGER,
-            issued_at TEXT
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS issued (
-            user_id INTEGER PRIMARY KEY,
-            code TEXT,
-            issued_at TEXT
+            issued_at TEXT,
+            paid INTEGER DEFAULT 0
         )
     """)
     conn.commit()
@@ -88,24 +80,6 @@ def get_unused_code():
     return code
 
 
-def get_user_code(user_id):
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.execute("SELECT code FROM issued WHERE user_id=?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-
-def save_user_code(user_id, code):
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO issued (user_id, code, issued_at) VALUES (?, ?, ?)",
-              (user_id, code, datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
-
-
 def stats():
     conn = sqlite3.connect(DB)
     c = conn.cursor()
@@ -117,107 +91,87 @@ def stats():
     return free, used
 
 
-# ==================== ПРОВЕРКА ПОДПИСКИ ====================
-async def is_subscribed(user_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(CHANNEL_ID, user_id)
-        return member.status in [
-            ChatMemberStatus.MEMBER,
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.CREATOR,
-        ]
-    except Exception as e:
-        logging.error(f"Ошибка проверки подписки: {e}")
-        return False
-
-
 # ==================== КЛАВИАТУРЫ ====================
-def main_kb():
+def buy_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📢 Подписаться на канал", url=CHANNEL_LINK)],
-        [InlineKeyboardButton(text="✅ Я подписался", callback_data="check")],
+        [InlineKeyboardButton(
+            text=f"⭐ Купить код — {CODE_PRICE_STARS} Stars",
+            callback_data="buy_code"
+        )],
     ])
 
 
 # ==================== ХЕНДЛЕРЫ ====================
 @dp.message(CommandStart())
 async def start_cmd(msg: Message):
-    user_id = msg.from_user.id
-    existing = get_user_code(user_id)
-    if existing:
+    await msg.answer(
+        f"👋 Привет!\n\n"
+        f"🎁 Здесь можно купить одноразовый промокод для игры «Ласка-Оборона NS-01».\n\n"
+        f"💰 Цена: <b>{CODE_PRICE_STARS} Stars</b> за один код.\n"
+        f"🔑 Один код = один раз активируется в игре.\n\n"
+        f"Нажми кнопку ниже, чтобы купить:",
+        reply_markup=buy_kb(),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data == "buy_code")
+async def buy_cb(cb: CallbackQuery):
+    await bot.send_invoice(
+        chat_id=cb.from_user.id,
+        title="Промокод для Ласка-Оборона NS-01",
+        description=f"Одноразовый промокод. Активируется один раз в игре.",
+        payload=f"promo_{cb.from_user.id}_{int(datetime.utcnow().timestamp())}",
+        provider_token="",  # для Stars оставляем пустым
+        currency="XTR",     # XTR = Telegram Stars
+        prices=[LabeledPrice(label="Промокод", amount=CODE_PRICE_STARS)],
+    )
+    await cb.answer()
+
+
+@dp.pre_checkout_query()
+async def pre_checkout(query: PreCheckoutQuery):
+    # Обязательно подтвердить в течение 10 секунд
+    await query.answer(ok=True)
+
+
+@dp.message(F.successful_payment)
+async def payment_success(msg: Message):
+    # Оплата прошла — выдаём код
+    code = get_unused_code()
+    if code:
         await msg.answer(
-            f"🎁 Твой промокод:\n\n<code>{existing}</code>\n\n"
+            f"✅ <b>Оплата получена!</b>\n\n"
+            f"🎁 Твой промокод:\n\n<code>{code}</code>\n\n"
             f"Скопируй его и введи в игре «Ласка-Оборона NS-01».",
             parse_mode="HTML"
         )
-        return
-
-    if await is_subscribed(user_id):
-        code = get_unused_code()
-        if code:
-            save_user_code(user_id, code)
-            await msg.answer(
-                f"✅ <b>Подписка подтверждена!</b>\n\n"
-                f"🎁 Твой одноразовый промокод:\n\n<code>{code}</code>\n\n"
-                f"Скопируй его и введи в игре.",
-                parse_mode="HTML"
-            )
-        else:
-            await msg.answer("😔 Коды закончились. Напиши разработчику.")
+        # Логируем покупку
+        logging.info(f"Пользователь {msg.from_user.id} купил код {code}")
     else:
         await msg.answer(
-            "👋 Привет! Чтобы получить промокод:\n\n"
-            "1. Оформи подписку на Boosty\n"
-            "2. Получи доступ к закрытому каналу\n"
-            "3. Нажми «Я подписался» ниже",
-            reply_markup=main_kb(),
-            parse_mode="HTML"
+            "⚠️ Оплата прошла, но коды закончились.\n"
+            f"Напиши @твой_ник — выдам код вручную."
         )
 
 
-@dp.callback_query(F.data == "check")
-async def check_cb(cb: CallbackQuery):
-    user_id = cb.from_user.id
-    existing = get_user_code(user_id)
-    if existing:
-        await cb.message.answer(
-            f"🎁 Твой промокод:\n\n<code>{existing}</code>",
-            parse_mode="HTML"
-        )
-        await cb.answer()
-        return
-
-    if await is_subscribed(user_id):
-        code = get_unused_code()
-        if code:
-            save_user_code(user_id, code)
-            await cb.message.answer(
-                f"✅ Подписка подтверждена!\n\n🎁 Твой код:\n\n<code>{code}</code>",
-                parse_mode="HTML"
-            )
-        else:
-            await cb.message.answer("😔 Коды закончились.")
-    else:
-        await cb.answer("❌ Ты ещё не подписан на канал", show_alert=True)
-
-
-# ==================== КОМАНДЫ АДМИНА ====================
-@dp.message(F.from_user.id == ADMIN_ID, F.text.startswith("/gen"))
+# ==================== АДМИН-КОМАНДЫ ====================
+@dp.message(F.from_user.id == ADMIN_ID, Command("gen"))
 async def gen_cmd(msg: Message):
     parts = msg.text.split()
     count = int(parts[1]) if len(parts) > 1 else 100
     added = generate_codes(count)
     free, used = stats()
-    await msg.answer(f"✅ Сгенерировано {added} кодов.\nСвободных: {free}\nВыдано: {used}")
+    await msg.answer(f"✅ Сгенерировано {added}.\nСвободных: {free}\nПродано: {used}")
 
 
-@dp.message(F.from_user.id == ADMIN_ID, F.text == "/stats")
+@dp.message(F.from_user.id == ADMIN_ID, Command("stats"))
 async def stats_cmd(msg: Message):
     free, used = stats()
-    await msg.answer(f"📊 Статистика:\nСвободных: {free}\nВыдано: {used}")
+    await msg.answer(f"📊 Статистика:\nСвободных: {free}\nПродано: {used}")
 
 
-@dp.message(F.from_user.id == ADMIN_ID, F.text == "/export")
+@dp.message(F.from_user.id == ADMIN_ID, Command("export"))
 async def export_cmd(msg: Message):
     conn = sqlite3.connect(DB)
     c = conn.cursor()
@@ -229,7 +183,7 @@ async def export_cmd(msg: Message):
         return
     text = "\n".join(codes)
     if len(text) > 4000:
-        text = text[:4000] + f"\n\n... и ещё {len(codes) - text.count(chr(10)) - 1}"
+        text = text[:4000] + f"\n\n... (ещё {len(codes)} штук)"
     await msg.answer(f"📋 Свободные коды:\n\n<code>{text}</code>", parse_mode="HTML")
 
 
@@ -238,8 +192,8 @@ async def main():
     init_db()
     free, _ = stats()
     if free == 0:
-        generate_codes(100)
-        logging.info("Сгенерировано 100 стартовых кодов")
+        generate_codes(50)
+        logging.info("Сгенерировано 50 стартовых кодов")
     logging.info("Бот запущен")
     await dp.start_polling(bot)
 
